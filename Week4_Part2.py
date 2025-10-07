@@ -1,589 +1,394 @@
 """
-Enhanced Monte Carlo Tree Search with Process-Guided Reasoning
-=============================================================
 
-A novel approach to mathematical reasoning that combines tree search 
-with step-by-step process evaluation to improve solution quality.
+Large Language Models as Commonsense Knowledge for Large-Scale Task Planning
+
+
+LLM-MCTS planner (compact, research-oriented).
+- Implements a Monte Carlo Tree Search where:
+  * LLM acts as world model: given state + action -> next state description + immediate reward estimate
+  * LLM acts as policy heuristic: given state -> ranked candidate actions
+- Demonstration task: product-launch checklist planning
+
+Caveats:
+- This is a practical research implementation, simplified for clarity.
+- You can choose LLM backend: "openai" (requires API key) or "hf" (local HF model).
 """
 
-import numpy as np
+import os
 import math
 import random
-from typing import List, Tuple, Optional, Dict, Any
-from dataclasses import dataclass
-from enum import Enum
+import time
+from copy import deepcopy
+from typing import List, Tuple, Any, Optional
+from dataclasses import dataclass, field
 
+# choose backend; default to "openai" if key present; else "hf"
+DEFAULT_BACKEND = "openai" if os.getenv("OPENAI_API_KEY") else "hf"
 
-# ============================================================================
-# CORE DATA STRUCTURES
-# ============================================================================
+# choose model names
+OPENAI_MODEL = "gpt-4o-mini"  # replace with desired model
+HF_MODEL = "google/flan-t5-small"  # small, reasonably capable for testing
 
-@dataclass
-class MathQuestion:
-    """Represents a mathematical word problem"""
-    text: str
-    solution: float
-    step_sequence: List[str]
-    complexity: str
+# LLM timeout / rate-limiting safe pause
+LLM_DELAY = 0.6
 
-
-class ReasoningStage:
-    """A single step in the reasoning process"""
-    
-    def __init__(self, explanation: str, operation: str, result: float, valid: bool):
-        self.explanation = explanation
-        self.operation = operation
-        self.result = result
-        self.valid = valid
-    
-    def __str__(self):
-        return f"Stage[{self.explanation}, result={self.result}]"
-
-
-class MockLanguageModel:
-    """Simulates an LLM for mathematical reasoning"""
-    
-    def __init__(self, precision=0.82, mistake_prob=0.18):
-        self.precision = precision
-        self.mistake_prob = mistake_prob
-    
-    def produce_candidate_steps(self, 
-                               question: MathQuestion, 
-                               current_path: List[ReasoningStage],
-                               candidate_count: int = 3) -> List[ReasoningStage]:
-        candidates = []
-        
-        current_step_index = len(current_path)
-        expected_sequence = question.step_sequence
-        
-        if current_step_index >= len(expected_sequence):
-            return []
-        
-        correct_operation = expected_sequence[current_step_index]
-        
-        for _ in range(candidate_count):
-            if random.random() < self.precision:
-                candidate = self._create_valid_step(question, current_path, correct_operation)
-            else:
-                candidate = self._create_flawed_step(question, current_path)
-            
-            candidates.append(candidate)
-        
-        return candidates
-    
-    def _create_valid_step(self, 
-                          question: MathQuestion,
-                          current_path: List[ReasoningStage],
-                          operation: str) -> ReasoningStage:
-
-        if len(current_path) == 0:
-            current_val = self._get_starting_value(question.text)
+# --------------------------
+#  LLM Interface (OpenAI or HF)
+# --------------------------
+class LLMInterface:
+    def __init__(self, backend: str = DEFAULT_BACKEND, hf_model: str = HF_MODEL, openai_model: str = OPENAI_MODEL, temp: float = 0.2):
+        self.backend = backend
+        self.temp = temp
+        self.openai_model = openai_model
+        self.hf_model = hf_model
+        if backend == "openai":
+            try:
+                import openai
+            except Exception as e:
+                raise RuntimeError("openai package required for openai backend. pip install openai") from e
+            self.openai = openai
+        elif backend == "hf":
+            try:
+                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+            except Exception as e:
+                raise RuntimeError("transformers package required for hf backend. pip install transformers torch") from e
+            self.tokenizer = AutoTokenizer.from_pretrained(hf_model)
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(hf_model)
+            self.pipeline = pipeline("text2text-generation", model=self.model, tokenizer=self.tokenizer)
         else:
-            current_val = current_path[-1].result
-        
-        if "add" in operation or "+" in operation:
-            operand = self._derive_operand(question.text, "add", len(current_path))
-            new_val = current_val + operand
-            explanation = f"Increase by {operand}: {current_val} + {operand} = {new_val}"
-        
-        elif "subtract" in operation or "-" in operation:
-            operand = self._derive_operand(question.text, "subtract", len(current_path))
-            new_val = current_val - operand
-            explanation = f"Decrease by {operand}: {current_val} - {operand} = {new_val}"
-        
-        elif "multiply" in operation or "*" in operation:
-            operand = self._derive_operand(question.text, "multiply", len(current_path))
-            new_val = current_val * operand
-            explanation = f"Multiply by {operand}: {current_val} × {operand} = {new_val}"
-        
-        elif "divide" in operation or "/" in operation:
-            operand = self._derive_operand(question.text, "divide", len(current_path))
-            new_val = current_val / operand if operand != 0 else current_val
-            explanation = f"Divide by {operand}: {current_val} ÷ {operand} = {new_val}"
-        
+            raise ValueError("backend must be 'openai' or 'hf'")
+
+    def call(self, prompt: str, max_tokens: int = 200) -> str:
+        """Single-turn LLM call returning text."""
+        if self.backend == "openai":
+            # Chat completion style
+            # uses chat completions if supported; fallback to completion-like call
+            time.sleep(LLM_DELAY)
+            resp = self.openai.ChatCompletion.create(
+                model=self.openai_model,
+                messages=[{"role":"user","content":prompt}],
+                temperature=self.temp,
+                max_tokens=max_tokens,
+            )
+            # find assistant reply
+            text = resp["choices"][0]["message"]["content"].strip()
+            return text
         else:
-            new_val = current_val
-            explanation = f"Conclusion: {new_val}"
-        
-        return ReasoningStage(explanation, operation, new_val, valid=True)
-    
-    def _create_flawed_step(self,
-                           question: MathQuestion,
-                           current_path: List[ReasoningStage]) -> ReasoningStage:
-        
-        if len(current_path) == 0:
-            current_val = self._get_starting_value(question.text)
-        else:
-            current_val = current_path[-1].result
-        
-        error_categories = [
-            ("incorrect_operation", "Wrong operation applied"),
-            ("calculation_error", "Arithmetic mistake"),
-            ("missing_step", "Essential step omitted")
-        ]
-        
-        error_category, _ = random.choice(error_categories)
-        
-        if error_category == "incorrect_operation":
-            operations = ["add", "subtract", "multiply"]
-            chosen_op = random.choice(operations)
-            operand = random.randint(1, 10)
-            
-            if chosen_op == "add":
-                new_val = current_val + operand
-                explanation = f"Add {operand}: {current_val} + {operand} = {new_val}"
-            elif chosen_op == "subtract":
-                new_val = current_val - operand
-                explanation = f"Subtract {operand}: {current_val} - {operand} = {new_val}"
-            else:
-                new_val = current_val * operand
-                explanation = f"Multiply by {operand}: {current_val} × {operand} = {new_val}"
-        
-        elif error_category == "calculation_error":
-            operand = random.randint(1, 10)
-            correct = current_val + operand
-            incorrect = correct + random.randint(-3, 3)
-            new_val = incorrect
-            explanation = f"Add {operand}: {current_val} + {operand} = {new_val}"
-        
-        else:
-            new_val = current_val + random.randint(5, 15)
-            explanation = f"Compute: {new_val}"
-        
-        return ReasoningStage(explanation, "error", new_val, valid=False)
-    
-    def _get_starting_value(self, question: str) -> float:
-        import re
-        digits = re.findall(r'\d+', question)
-        return float(digits[0]) if digits else 0.0
-    
-    def _derive_operand(self, question: str, operation: str, step_index: int) -> float:
-        import re
-        digits = re.findall(r'\d+', question)
-        if step_index + 1 < len(digits):
-            return float(digits[step_index + 1])
-        return 1.0
-    
-    def assess_step_quality(self, 
-                          step: ReasoningStage,
-                          question: MathQuestion,
-                          previous_steps: List[ReasoningStage]) -> float:
+            # HF pipeline call
+            time.sleep(LLM_DELAY)
+            out = self.pipeline(prompt, max_length=max_tokens, do_sample=True, temperature=self.temp)
+            return out[0]["generated_text"].strip()
 
-        base_quality = 0.9 if step.valid else 0.1
-        variation = random.uniform(-0.1, 0.1)
-        quality_score = max(0.0, min(1.0, base_quality + variation))
-        
-        return quality_score
+# --------------------------
+#  Planning domain: product launch
+# --------------------------
+"""
+State representation (simple text):
+- 'state' is a bullet-list of completed items and current resources (budget, days_left).
+Action space:
+- templated actions like "Prepare marketing plan", "Book venue", "Design landing page", "Hire contractor", etc.
+We will let the LLM suggest candidate actions (policy), and the LLM world-model will predict effects of performing an action.
+"""
 
-
-# ============================================================================
-# PROCESS EVALUATION ENGINE
-# ============================================================================
-
-class StepQualityEvaluator:
-
-    def __init__(self, language_model: MockLanguageModel):
-        self.language_model = language_model
-    
-    def compute_path_quality(self,
-                           steps: List[ReasoningStage],
-                           question: MathQuestion) -> float:
-        
-        if not steps:
-            return 0.0
-        
-        cumulative_quality = 0.0
-        
-        for idx, step in enumerate(steps):
-            step_reward = self.language_model.assess_step_quality(step, question, steps[:idx])
-            
-            total_expected = len(question.step_sequence)
-            remaining_steps = max(0, total_expected - idx - 1)
-            
-            adjusted_reward = self._adjust_reward(cumulative_quality, step_reward, remaining_steps)
-            
-            cumulative_quality = max(cumulative_quality + adjusted_reward, 0.0)
-            cumulative_quality = min(cumulative_quality, 1.0)
-        
-        return cumulative_quality
-    
-    def _adjust_reward(self,
-                     previous_quality: float,
-                     step_reward: float,
-                     steps_remaining: int) -> float:
-
-        adjustment_numerator = 1.0 - previous_quality
-        adjustment_denominator = steps_remaining + 1
-        correction_factor = 1.0 - 2.0 * step_reward
-        
-        adjusted_value = (adjustment_numerator / adjustment_denominator) * correction_factor
-        
-        return adjusted_value
-    
-    def estimate_remaining_complexity(self,
-                                    steps: List[ReasoningStage],
-                                    question: MathQuestion) -> int:
-
-        total_steps = len(question.step_sequence)
-        completed_steps = len(steps)
-        return max(0, total_steps - completed_steps)
-
-
-# ============================================================================
-# TREE SEARCH IMPLEMENTATION
-# ============================================================================
-
-class SearchTreeNode:
-    
-    def __init__(self,
-                 reasoning_path: List[ReasoningStage],
-                 parent_node=None,
-                 latest_step=None):
-        self.reasoning_path = reasoning_path.copy() if reasoning_path else []
-        self.parent_node = parent_node
-        self.latest_step = latest_step
-        
-        # Search statistics
-        self.visits = 0
-        self.accumulated_reward = 0.0
-        self.average_reward = 0.0
-        
-        # Quality metrics
-        self.path_quality = 0.0
-        
-        # Child management
-        self.child_nodes = []
-        self.pending_expansions = []
-    
-    def has_full_expansion(self):
-        return len(self.pending_expansions) == 0
-    
-    def is_complete_path(self, question: MathQuestion):
-        return len(self.reasoning_path) >= len(question.step_sequence)
-    
-    def select_best_child_uct(self, exploration_param=1.414):
-        scores = []
-        for child in self.child_nodes:
-            if child.visits == 0:
-                uct_score = float('inf')
-            else:
-                exploitation = child.average_reward
-                exploration = exploration_param * math.sqrt(
-                    2 * math.log(self.visits) / child.visits
-                )
-                uct_score = exploitation + exploration
-            scores.append(uct_score)
-        
-        return self.child_nodes[np.argmax(scores)]
-    
-    def select_best_child_quality(self):
-        if not self.child_nodes:
-            return None
-        return max(self.child_nodes, key=lambda node: node.path_quality)
-
-
-class GuidedTreeSearch:
-
-    
-    def __init__(self,
-                 language_model: MockLanguageModel,
-                 quality_evaluator: StepQualityEvaluator,
-                 max_search_iterations: int = 100,
-                 exploration_factor: float = 1.414):
-        self.language_model = language_model
-        self.quality_evaluator = quality_evaluator
-        self.max_search_iterations = max_search_iterations
-        self.exploration_factor = exploration_factor
-        
-        self.total_nodes = 0
-        self.total_evaluations = 0
-    
-    def find_solution(self, question: MathQuestion) -> List[ReasoningStage]:
-
-        root_node = SearchTreeNode(reasoning_path=[])
-        root_node.path_quality = 0.0
-        
-        for iteration in range(self.max_search_iterations):
-            current_node = root_node
-            
-            while not current_node.is_complete_path(question) and current_node.has_full_expansion():
-                current_node = current_node.select_best_child_quality() if current_node.child_nodes else current_node
-            
-            if not current_node.is_complete_path(question):
-                if not current_node.pending_expansions:
-                    candidate_steps = self.language_model.produce_candidate_steps(
-                        question, current_node.reasoning_path, candidate_count=3
-                    )
-                    current_node.pending_expansions = candidate_steps
-                
-                if current_node.pending_expansions:
-                    new_step = current_node.pending_expansions.pop()
-                    extended_path = current_node.reasoning_path + [new_step]
-                    
-                    new_node = SearchTreeNode(
-                        reasoning_path=extended_path,
-                        parent_node=current_node,
-                        latest_step=new_step
-                    )
-                    
-                    new_node.path_quality = self.quality_evaluator.compute_path_quality(
-                        extended_path, question
-                    )
-                    
-                    current_node.child_nodes.append(new_node)
-                    current_node = new_node
-                    self.total_nodes += 1
-            
-            solution_score = self._assess_solution_quality(current_node.reasoning_path, question)
-            self.total_evaluations += 1
-            
-            self._update_node_statistics(current_node, solution_score)
-        
-        best_node = root_node.select_best_child_quality()
-        if best_node:
-            return best_node.reasoning_path
-        return []
-    
-    def _assess_solution_quality(self,
-                               steps: List[ReasoningStage],
-                               question: MathQuestion) -> float:
-
-        if not steps:
-            return 0.0
-        
-        final_result = steps[-1].result
-        is_correct = abs(final_result - question.solution) < 0.01
-        
-        return 1.0 if is_correct else 0.0
-    
-    def _update_node_statistics(self, node: SearchTreeNode, reward: float):
-        while node is not None:
-            node.visits += 1
-            node.accumulated_reward += reward
-            node.average_reward = node.accumulated_reward / node.visits
-            node = node.parent_node
-
-
-# ============================================================================
-# COMPARISON METHODS
-# ============================================================================
-
-def solve_direct_approach(question: MathQuestion, language_model: MockLanguageModel) -> List[ReasoningStage]:
-    steps = []
-    
-    for i in range(len(question.step_sequence)):
-        candidates = language_model.produce_candidate_steps(question, steps, candidate_count=1)
-        if candidates:
-            steps.append(candidates[0])
-    
-    return steps
-
-
-def solve_basic_mcts(question: MathQuestion,
-                     language_model: MockLanguageModel,
-                     max_iterations: int = 100) -> List[ReasoningStage]:
-
-    root = SearchTreeNode(reasoning_path=[])
-    
-    for _ in range(max_iterations):
-        current_node = root
-        
-        while not current_node.is_complete_path(question) and current_node.has_full_expansion():
-            current_node = current_node.select_best_child_uct()
-        
-        if not current_node.is_complete_path(question):
-            if not current_node.pending_expansions:
-                current_node.pending_expansions = language_model.produce_candidate_steps(question, current_node.reasoning_path)
-            
-            if current_node.pending_expansions:
-                new_step = current_node.pending_expansions.pop()
-                child_node = SearchTreeNode(
-                    reasoning_path=current_node.reasoning_path + [new_step],
-                    parent_node=current_node,
-                    latest_step=new_step
-                )
-                current_node.child_nodes.append(child_node)
-                current_node = child_node
-        
-        reward = 1.0 if current_node.reasoning_path and abs(current_node.reasoning_path[-1].result - question.solution) < 0.01 else 0.0
-        
-        while current_node:
-            current_node.visits += 1
-            current_node.accumulated_reward += reward
-            current_node.average_reward = current_node.accumulated_reward / current_node.visits if current_node.visits > 0 else 0
-            current_node = current_node.parent_node
-    
-    best_node = max(root.child_nodes, key=lambda node: node.visits) if root.child_nodes else root
-    return best_node.reasoning_path
-
-
-# ============================================================================
-# DEMONSTRATION AND TESTING
-# ============================================================================
-
-# Sample mathematical problems
-MATH_PROBLEMS = [
-    MathQuestion(
-        text="Sarah has 5 apples. She buys 3 more apples, then gives 2 to her friend. How many apples does Sarah have now?",
-        solution=6.0,
-        step_sequence=["add_3", "subtract_2"],
-        complexity="simple"
-    ),
-    MathQuestion(
-        text="A store has 12 shirts. They sell 4 shirts, then receive a shipment of 7 more shirts. How many shirts does the store have?",
-        solution=15.0,
-        step_sequence=["subtract_4", "add_7"],
-        complexity="simple"
-    ),
-    MathQuestion(
-        text="Tom has 8 candies. He gets 3 times as many from his mom, then eats 5. How many candies does he have left?",
-        solution=19.0,
-        step_sequence=["multiply_3", "subtract_5"],
-        complexity="intermediate"
-    ),
+DEFAULT_ACTIONS = [
+    "Define target customers and messaging",
+    "Create product landing page",
+    "Prepare marketing plan (email + social)",
+    "Design product packaging",
+    "Set pricing and offers",
+    "Book launch venue or virtual platform",
+    "Arrange a demo and QA session",
+    "Prepare press release and outreach list",
+    "Run an initial paid ad test",
+    "Coordinate supply chain & inventory",
+    "Arrange customer support channels",
+    "Set up analytics and tracking",
+    "Create launch day checklist",
 ]
 
+@dataclass
+class PlanState:
+    completed: List[str] = field(default_factory=list)
+    days_left: int = 30
+    budget: float = 5000.0
+    notes: List[str] = field(default_factory=list)
 
-def assess_method_performance(method_name: str,
-                            solver_function,
-                            problems: List[MathQuestion],
-                            trials: int = 5) -> Dict:
+    def text(self) -> str:
+        lines = [
+            f"Days left: {self.days_left}",
+            f"Budget: ${self.budget:.2f}",
+            "Completed items:"
+        ]
+        if self.completed:
+            lines += [f"- {c}" for c in self.completed]
+        else:
+            lines += ["- (none)"]
+        if self.notes:
+            lines += ["Notes:"] + [f"- {n}" for n in self.notes]
+        return "\n".join(lines)
 
-    
-    performance = {
-        'success_count': 0,
-        'total_attempts': 0,
-        'breakdown': []
-    }
-    
-    for problem in problems:
-        for trial_num in range(trials):
-            solution_path = solver_function(problem)
-            
-            if solution_path:
-                final_result = solution_path[-1].result
-                correct = abs(final_result - problem.solution) < 0.01
+    def clone(self):
+        return deepcopy(self)
+
+# --------------------------
+#  Simple LLM-driven domain functions
+# --------------------------
+def build_world_model_prompt(state: PlanState, action: str) -> str:
+    return (
+        "You are a helpful planner engine that predicts the immediate outcome of taking an action in a product launch planning context.\n\n"
+        f"Current state:\n{state.text()}\n\n"
+        f"Action to simulate: {action}\n\n"
+        "Respond with three lines only, labeled EXACTLY as follows:\n"
+        "NEXT_STATE: <one-line summary of the new state (days_left and budget updated, and newly completed item)>\n"
+        "REWARD: <numeric reward between -1.0 and +1.0 representing how good this action is right now>\n"
+        "NOTE: <concise note about side-effects or important dependencies (one sentence)>"
+    )
+
+def build_policy_prompt(state: PlanState, candidate_pool: List[str], k: int = 6) -> str:
+    # ask LLM to rank candidate actions and optionally add any new suggestions
+    return (
+        "You are an expert startup operations planner. Given the current state, rank the most promising next steps (max {} choices).\n\n"
+        "State:\n"
+        "{}\n\n"
+        "Candidate actions (you can reorder and optionally add 1-2 additional short actions):\n- {}\n\n"
+        "Return a numbered list (1..n) of your top picks with very brief justification (one short phrase per item)."
+    ).format(k, state.text(), "\n- ".join(candidate_pool))
+
+# parse world model reply
+def parse_world_model_reply(reply: str) -> Tuple[PlanState, float, str]:
+    # naive parsing, robust-ish
+    lines = [l.strip() for l in reply.splitlines() if l.strip()]
+    next_state_text = ""
+    reward = 0.0
+    note = ""
+    for l in lines:
+        if l.upper().startswith("NEXT_STATE:"):
+            next_state_text = l.split(":",1)[1].strip()
+        elif l.upper().startswith("REWARD:"):
+            try:
+                reward = float(l.split(":",1)[1].strip())
+            except:
+                # fallback: try extract float anywhere
+                import re
+                m = re.search(r"[-+]?\d*\.\d+|\d+", l)
+                if m: reward = float(m.group(0))
+        elif l.upper().startswith("NOTE:"):
+            note = l.split(":",1)[1].strip()
+    # very simple update logic: try to extract days/budget/completed from next_state_text heuristically
+    ns = PlanState()
+    ns.completed = []
+    ns.notes = []
+    ns.days_left = None
+    ns.budget = None
+    # parse days and budget
+    import re
+    d = re.search(r"Days? left[: ]*([0-9]+)", next_state_text, re.I)
+    b = re.search(r"Budget[: ]*\$?([0-9]+(?:\.[0-9]+)?)", next_state_text, re.I)
+    if d:
+        ns.days_left = int(d.group(1))
+    if b:
+        ns.budget = float(b.group(1))
+    # parse completed item
+    comp = re.search(r"completed[: ]*(.+)$", next_state_text, re.I)
+    if comp:
+        ns.completed = [comp.group(1).strip()]
+    # fallback: put raw next_state_text into notes if parsing failed
+    if ns.days_left is None: ns.days_left = 0
+    if ns.budget is None: ns.budget = 0.0
+    if not ns.completed:
+        ns.notes = [next_state_text]
+    return ns, reward, note
+
+# --------------------------
+#  MCTS implementation
+# --------------------------
+class MCTSNode:
+    def __init__(self, state: PlanState, parent=None, action_from_parent: Optional[str]=None):
+        self.state = state
+        self.parent = parent
+        self.action_from_parent = action_from_parent
+        self.children: List['MCTSNode'] = []
+        self._untried_actions: Optional[List[str]] = None
+        self.visits = 0
+        self.value = 0.0  # cumulative value
+
+    def untried_actions(self, candidate_pool: List[str]) -> List[str]:
+        if self._untried_actions is None:
+            # actions that are not yet completed and not in children
+            completed = set(self.state.completed)
+            all_actions = [a for a in candidate_pool if a not in completed]
+            # remove those that we already expanded
+            expanded = {c.action_from_parent for c in self.children if c.action_from_parent}
+            self._untried_actions = [a for a in all_actions if a not in expanded]
+        return self._untried_actions
+
+    def uct_select_child(self, c_param: float = 1.4) -> 'MCTSNode':
+        # UCT: value/visits + c * sqrt(2 ln N / n)
+        choices = []
+        for ch in self.children:
+            if ch.visits == 0:
+                score = float('inf')
             else:
-                correct = False
-            
-            performance['total_attempts'] += 1
-            if correct:
-                performance['success_count'] += 1
-            
-            performance['breakdown'].append({
-                'problem': problem.text[:50] + "...",
-                'correct': correct,
-                'step_count': len(solution_path)
-            })
-    
-    performance['success_rate'] = performance['success_count'] / performance['total_attempts'] if performance['total_attempts'] > 0 else 0
-    
-    return performance
+                score = (ch.value / ch.visits) + c_param * math.sqrt(math.log(self.visits + 1) / ch.visits)
+            choices.append((score, ch))
+        # pick highest
+        _, best = max(choices, key=lambda x: x[0])
+        return best
 
+    def add_child(self, action: str, next_state: PlanState):
+        child = MCTSNode(state=next_state, parent=self, action_from_parent=action)
+        self.children.append(child)
+        # invalidate untried actions cache
+        self._untried_actions = None
+        return child
 
-def execute_demonstration():
-    
-    print("=" * 80)
-    print("PROCESS-GUIDED TREE SEARCH FOR MATHEMATICAL REASONING")
-    print("Advanced Algorithm Demonstration")
-    print("=" * 80)
-    
-    # Initialize system components
-    language_model = MockLanguageModel(precision=0.85)
-    quality_evaluator = StepQualityEvaluator(language_model)
-    
-    print("\n[1/4] Demonstrating Guided Tree Search...")
-    print("-" * 80)
-    
-    sample_problem = MATH_PROBLEMS[0]
-    print(f"\nProblem: {sample_problem.text}")
-    print(f"Expected Solution: {sample_problem.solution}")
-    
-    # Execute guided search
-    search_engine = GuidedTreeSearch(language_model, quality_evaluator, max_search_iterations=50)
-    solution_path = search_engine.find_solution(sample_problem)
-    
-    print(f"\nSolution Path ({len(solution_path)} steps):")
-    for step_num, step in enumerate(solution_path, 1):
-        quality_score = quality_evaluator.language_model.assess_step_quality(step, sample_problem, solution_path[:step_num])
-        print(f"  Step {step_num}: {step.explanation}")
-        print(f"         Quality Score: {quality_score:.3f}, Valid: {step.valid}")
-    
-    if solution_path:
-        final_answer = solution_path[-1].result
-        correct_solution = abs(final_answer - sample_problem.solution) < 0.01
-        print(f"\nComputed Answer: {final_answer}")
-        print(f"Evaluation: {'✓ CORRECT' if correct_solution else '✗ INCORRECT'}")
-    
-    # Display quality metrics
-    overall_quality = quality_evaluator.compute_path_quality(solution_path, sample_problem)
-    print(f"\nOverall Path Quality: {overall_quality:.3f}")
-    print(f"Nodes Generated: {search_engine.total_nodes}")
-    print(f"Path Evaluations: {search_engine.total_evaluations}")
-    
-    print("\n[2/4] Performance Comparison...")
-    print("-" * 80)
-    
-    comparison_methods = [
-        ("Direct Generation", lambda p: solve_direct_approach(p, language_model)),
-        ("Standard MCTS", lambda p: solve_basic_mcts(p, language_model, 50)),
-        ("Guided Tree Search", lambda p: GuidedTreeSearch(language_model, quality_evaluator, 50).find_solution(p))
-    ]
-    
-    print(f"\nTesting on {len(MATH_PROBLEMS)} problems, 3 trials each...")
-    
-    for method_label, solver in comparison_methods:
-        results = assess_method_performance(method_label, solver, MATH_PROBLEMS, trials=3)
-        print(f"\n{method_label}:")
-        print(f"  Success Rate: {results['success_rate']*100:.1f}% ({results['success_count']}/{results['total_attempts']})")
-    
-    print("\n[3/4] Step Quality Analysis...")
-    print("-" * 80)
-    
-    analysis_problem = MATH_PROBLEMS[1]
-    print(f"\nProblem: {analysis_problem.text}")
-    
-    # Generate sample reasoning path
-    reasoning_steps = []
-    for step_idx in range(2):
-        candidates = language_model.produce_candidate_steps(analysis_problem, reasoning_steps)
-        if candidates:
-            reasoning_steps.append(candidates[0])
-    
-    print("\nStep-by-Step Quality Assessment:")
-    current_quality = 0.0
-    for step_idx, step in enumerate(reasoning_steps):
-        step_reward = language_model.assess_step_quality(step, analysis_problem, reasoning_steps[:step_idx])
-        remaining_steps = quality_evaluator.estimate_remaining_complexity(reasoning_steps[:step_idx+1], analysis_problem)
-        reward_adjustment = quality_evaluator._adjust_reward(current_quality, step_reward, remaining_steps)
-        current_quality = max(current_quality + reward_adjustment, 0.0)
-        
-        print(f"\nStep {step_idx+1}: {step.explanation}")
-        print(f"  Step Reward: {step_reward:.3f}")
-        print(f"  Remaining Steps: {remaining_steps}")
-        print(f"  Reward Adjustment: {reward_adjustment:.3f}")
-        print(f"  Cumulative Quality: {current_quality:.3f}")
-    
-    print("\n[4/4] Implementation Highlights")
-    print("-" * 80)
-    
-    print("\n✓ Key Features Implemented:")
-    print("  1. Step quality evaluation system")
-    print("  2. Progressive quality accumulation")
-    print("  3. Remaining complexity estimation")
-    print("  4. Quality-guided tree search")
-    print("  5. Adaptive reward calculation")
-    
-    print("\n✓ Demonstrated Advantages:")
-    print("  - Superior to direct generation")
-    print("  - More efficient than standard MCTS")
-    print("  - Real-time step quality monitoring")
-    print("  - Progressive solution refinement")
-    
-    print("\n" + "=" * 80)
-    print("DEMONSTRATION COMPLETED")
-    print("=" * 80)
+    def update(self, reward: float):
+        self.visits += 1
+        self.value += reward
 
+class MCTS:
+    def __init__(self, llm: LLMInterface, candidate_pool: List[str], iterations: int = 100, c_param: float = 1.2, rollout_depth: int = 4):
+        self.llm = llm
+        self.candidate_pool = candidate_pool
+        self.iterations = iterations
+        self.c_param = c_param
+        self.rollout_depth = rollout_depth
+
+    def search(self, root_state: PlanState) -> Tuple[List[Tuple[str,float]], MCTSNode]:
+        root = MCTSNode(state=root_state)
+        for it in range(self.iterations):
+            node = root
+            # 1. Selection
+            while node.untried_actions(self.candidate_pool) == [] and node.children:
+                node = node.uct_select_child(self.c_param)
+            # 2. Expansion
+            untried = node.untried_actions(self.candidate_pool)
+            if untried:
+                # use LLM policy to rank a small batch of actions; pick top
+                policy_prompt = build_policy_prompt(node.state, untried[:max(6,len(untried))], k=6)
+                ranking = self.llm.call(policy_prompt, max_tokens=300)
+                # parse first suggested action if available
+                first_action = None
+                for line in ranking.splitlines():
+                    line = line.strip()
+                    if line and line[0].isdigit() and '.' in line:
+                        try:
+                            _, rest = line.split('.',1)
+                            first_action = rest.strip().split('-')[0].strip()
+                            break
+                        except:
+                            continue
+                if not first_action:
+                    first_action = random.choice(untried)
+                # simulate world-model to get next_state and reward
+                wprompt = build_world_model_prompt(node.state, first_action)
+                wm_reply = self.llm.call(wprompt, max_tokens=200)
+                next_state_partial, reward_est, note = parse_world_model_reply(wm_reply)
+                # create next state by merging info
+                next_state = node.state.clone()
+                if next_state_partial.completed:
+                    next_state.completed += next_state_partial.completed
+                if next_state_partial.notes:
+                    next_state.notes += next_state_partial.notes
+                # heuristics: decrease days/budget lightly if not provided explicitly
+                next_state.days_left = max(0, node.state.days_left - 2)
+                next_state.budget = max(0.0, node.state.budget - min(1000.0, node.state.budget*0.05))
+                child = node.add_child(first_action, next_state)
+                node = child
+                rollout_reward = self.simulate(node.state, depth=self.rollout_depth)
+                # combine rollout reward and immediate LLM reward
+                total_reward = 0.6 * reward_est + 0.4 * rollout_reward
+            else:
+                # no untried actions - leaf
+                rollout_reward = self.simulate(node.state, depth=self.rollout_depth)
+                total_reward = rollout_reward
+
+            # 4. Backpropagate
+            while node is not None:
+                node.update(total_reward)
+                node = node.parent
+        # after iterations, rank root children by value/visits
+        choices = []
+        for ch in root.children:
+            avg = (ch.value / ch.visits) if ch.visits>0 else 0.0
+            choices.append((ch.action_from_parent, avg))
+        choices.sort(key=lambda x: x[1], reverse=True)
+        return choices, root
+
+    def simulate(self, state: PlanState, depth: int = 3) -> float:
+        # simple rollout: greedily ask LLM policy for next actions and world model to score them,
+        # accumulating rewards; average reward returned.
+        total = 0.0
+        s = state.clone()
+        for d in range(depth):
+            pool = [a for a in self.candidate_pool if a not in s.completed]
+            if not pool:
+                break
+            prompt = build_policy_prompt(s, pool[:8], k=4)
+            policy_text = self.llm.call(prompt, max_tokens=200)
+            # pick first suggested action
+            chosen = None
+            for line in policy_text.splitlines():
+                line = line.strip()
+                if line and line[0].isdigit() and '.' in line:
+                    try:
+                        _, rest = line.split('.',1)
+                        chosen = rest.strip().split('-')[0].strip()
+                        break
+                    except:
+                        continue
+            if not chosen:
+                chosen = random.choice(pool)
+            wprompt = build_world_model_prompt(s, chosen)
+            wm_reply = self.llm.call(wprompt, max_tokens=200)
+            nxt_partial, r, note = parse_world_model_reply(wm_reply)
+            total += r
+            if nxt_partial.completed:
+                s.completed += nxt_partial.completed
+            s.days_left = max(0, s.days_left - 2)
+            s.budget = max(0.0, s.budget - min(800.0, s.budget * 0.04))
+        avg = total / max(1, depth)
+        return avg
+
+# --------------------------
+#  Example run
+# --------------------------
+def demo_run(backend: str = DEFAULT_BACKEND, iterations: int = 60):
+    print(f"Using backend: {backend}")
+    llm = LLMInterface(backend=backend)
+    # start state for product launch
+    start = PlanState(completed=[], days_left=30, budget=5000.0, notes=["Launch MVP in 30 days", "Small marketing budget"])
+    print("Start state:\n", start.text(), "\n")
+    mcts = MCTS(llm, candidate_pool=DEFAULT_ACTIONS, iterations=iterations, c_param=1.2, rollout_depth=3)
+    start_time = time.time()
+    choices, root = mcts.search(start)
+    dur = time.time() - start_time
+    print(f"\nMCTS completed {iterations} iterations in {dur:.1f}s. Top suggestions (action, score):")
+    for a, s in choices[:8]:
+        print(f" - {a}  (avg score {s:.3f})")
+    # print best path (greedy by child avg)
+    if choices:
+        best_action = choices[0][0]
+        print("\nBest first action recommended:", best_action)
+        # print rough plan by following top children greedily (depth-limited)
+        node = None
+        for ch in root.children:
+            if ch.action_from_parent == best_action:
+                node = ch; break
+        plan = []
+        cur = node
+        if cur:
+            plan.append((cur.action_from_parent, cur.state.text()))
+            for _ in range(4):
+                if not cur.children:
+                    break
+                # pick child with max avg
+                cur = max(cur.children, key=lambda c: (c.value / c.visits) if c.visits>0 else 0.0)
+                plan.append((cur.action_from_parent, cur.state.text()))
+        print("\nGreedy plan (approx):")
+        for i,(a,s) in enumerate(plan):
+            print(f"{i+1}. {a}\n   state snapshot: {s}\n")
 
 if __name__ == "__main__":
-    execute_demonstration()
+    # run demo
+    demo_run(backend=DEFAULT_BACKEND, iterations=60)
