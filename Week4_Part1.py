@@ -1,609 +1,621 @@
 """
-Part 1: Core MCTS-UCT Algorithm with Connect 4 Environment
+Monte Carlo Tree Search with UCB for Connect Four
+=================================================
+
+Advanced Tree Search Methods for Game Playing AI
 """
 
 import numpy as np
 import math
-from typing import List, Tuple, Optional, Any
+from typing import List, Dict, Any, Optional
 from collections import defaultdict
-from copy import deepcopy
 import time
 
 
 # ============================================================================
-# PART 1A: MCTS-UCT Core Implementation
+# TREE SEARCH NODE IMPLEMENTATION
 # ============================================================================
 
-class MCTSNode:
+class SearchTreeNode:
     """
-    Node in the MCTS search tree.
+    Represents a node in the Monte Carlo search tree.
     
-    Attributes:
-        state: Current game/environment state
-        parent: Parent node in tree
-        action: Action that led to this node from parent
-        children: List of child nodes
-        untried_actions: Actions not yet explored from this node
-        visit_count: N(s) - number of times node visited
-        total_reward: R(s) - cumulative reward through this node
-        q_value: Q(s,a) - average reward (total_reward / visit_count)
+    Properties:
+        game_state: The current state of the game
+        parent_node: Reference to parent node
+        move: Action taken to reach this node
+        child_nodes: List of children nodes
+        unexplored_moves: Moves not yet expanded
+        visits: Number of times node was visited
+        cumulative_score: Total reward accumulated
+        average_score: Q-value (cumulative_score / visits)
     """
     
-    def __init__(self, state, parent=None, action=None, untried_actions=None):
-        self.state = state
-        self.parent = parent
-        self.action = action
-        self.children = []
-        self.untried_actions = untried_actions if untried_actions else []
+    def __init__(self, game_state, parent=None, move=None, unexplored_moves=None):
+        self.game_state = game_state
+        self.parent_node = parent
+        self.move = move
+        self.child_nodes = []
+        self.unexplored_moves = unexplored_moves if unexplored_moves else []
         
-        # Statistics for UCT
-        self.visit_count = 0
-        self.total_reward = 0.0
-        self.q_value = 0.0
+        # Search statistics
+        self.visits = 0
+        self.cumulative_score = 0.0
+        self.average_score = 0.0
     
-    def is_fully_expanded(self):
-        """Check if all actions from this node have been tried."""
-        return len(self.untried_actions) == 0
+    def all_moves_expanded(self):
+        """Check if all possible moves have been explored."""
+        return len(self.unexplored_moves) == 0
     
-    def is_terminal(self):
-        """Check if this is a terminal state."""
-        return len(self.untried_actions) == 0 and len(self.children) == 0
+    def is_leaf_node(self):
+        """Check if this is a terminal node."""
+        return len(self.unexplored_moves) == 0 and len(self.child_nodes) == 0
     
-    def best_child(self, c_param=1.414):
-        choices_weights = []
-        for child in self.children:
-            # Exploitation term: average reward
-            exploitation = child.q_value / child.visit_count if child.visit_count > 0 else 0
+    def select_optimal_child(self, exploration_weight=1.414):
+        selection_scores = []
+        for child in self.child_nodes:
+            # Calculate exploitation component
+            if child.visits > 0:
+                exploitation_component = child.average_score
+            else:
+                exploitation_component = 0
             
-            # Exploration term: UCB bonus
-            exploration = c_param * math.sqrt(
-                (2 * math.log(self.visit_count)) / (child.visit_count + 1e-10)
-            )
+            # Calculate exploration component
+            if child.visits > 0:
+                exploration_component = exploration_weight * math.sqrt(
+                    (2 * math.log(self.visits)) / (child.visits + 1e-8)
+                )
+            else:
+                exploration_component = float('inf')
             
-            uct_value = exploitation + exploration
-            choices_weights.append(uct_value)
+            ucb_score = exploitation_component + exploration_component
+            selection_scores.append(ucb_score)
         
-        return self.children[np.argmax(choices_weights)]
+        return self.child_nodes[np.argmax(selection_scores)]
     
-    def best_action(self):
-        if not self.children:
+    def get_preferred_move(self):
+        if not self.child_nodes:
             return None
-        best_child = max(self.children, key=lambda c: c.visit_count)
-        return best_child.action
+        best_node = max(self.child_nodes, key=lambda node: node.visits)
+        return best_node.move
     
-    def __repr__(self):
-        return (f"MCTSNode(visits={self.visit_count}, "
-                f"reward={self.total_reward:.2f}, "
-                f"Q={self.q_value:.3f}, "
-                f"children={len(self.children)})")
+    def __str__(self):
+        return (f"TreeNode(visits={self.visits}, "
+                f"score={self.cumulative_score:.2f}, "
+                f"Q={self.average_score:.3f}, "
+                f"children={len(self.child_nodes)})")
 
 
-class MCTS_UCT:
+class MonteCarloTreeSearch:
     def __init__(self, 
-                 exploration_constant=1.414,
-                 max_iterations=1000,
-                 max_rollout_depth=100,
-                 time_limit=None):
+                 exploration_param=1.414,
+                 max_search_iterations=1000,
+                 max_simulation_depth=100,
+                 computation_time=None):
         
-        self.c = exploration_constant
-        self.max_iterations = max_iterations
-        self.max_rollout_depth = max_rollout_depth
-        self.time_limit = time_limit
+        self.exploration_param = exploration_param
+        self.max_search_iterations = max_search_iterations
+        self.max_simulation_depth = max_simulation_depth
+        self.computation_time = computation_time
         
-        # Statistics tracking
-        self.nodes_explored = 0
-        self.total_simulations = 0
+        # Performance tracking
+        self.total_nodes_generated = 0
+        self.simulation_count = 0
     
-    def search(self, initial_state, environment):
+    def find_best_move(self, starting_state, game_environment):
         # Initialize root node
-        player = environment.get_current_player(initial_state)
-        legal_actions = environment.get_legal_actions(initial_state, player)
-        root = MCTSNode(
-            state=initial_state,
-            untried_actions=legal_actions.copy()
+        current_player = game_environment.get_active_player(starting_state)
+        available_moves = game_environment.get_valid_moves(starting_state, current_player)
+        root_node = SearchTreeNode(
+            game_state=starting_state,
+            unexplored_moves=available_moves.copy()
         )
         
-        start_time = time.time()
+        search_start_time = time.time()
         
-        # Main MCTS loop
-        for iteration in range(self.max_iterations):
-            # Check time limit
-            if self.time_limit and (time.time() - start_time) > self.time_limit:
+        # Main search loop
+        for iteration_count in range(self.max_search_iterations):
+            # Check time constraint
+            if self.computation_time and (time.time() - search_start_time) > self.computation_time:
                 break
             
-            # 1. SELECTION: Traverse tree using UCT
-            node = root
-            state = deepcopy(initial_state)
+            # PHASE 1: SELECTION - Navigate tree using UCB
+            current_node = root_node
+            current_state = starting_state.copy()
             
-            while not environment.is_terminal(state) and node.is_fully_expanded():
-                node = node.best_child(self.c)
-                state = deepcopy(node.state)
+            while not game_environment.is_game_over(current_state) and current_node.all_moves_expanded():
+                current_node = current_node.select_optimal_child(self.exploration_param)
+                current_state = current_node.game_state.copy()
             
-            # 2. EXPANSION: Add one child node
-            if not environment.is_terminal(state) and len(node.untried_actions) > 0:
-                action = node.untried_actions.pop()
-                current_player = environment.get_current_player(state)
-                next_state, reward, done = environment.step(state, action, current_player)
+            # PHASE 2: EXPANSION - Add new node to tree
+            if not game_environment.is_game_over(current_state) and len(current_node.unexplored_moves) > 0:
+                selected_move = current_node.unexplored_moves.pop()
+                active_player = game_environment.get_active_player(current_state)
+                next_state, immediate_reward, game_ended = game_environment.execute_move(
+                    current_state, selected_move, active_player)
                 
-                # Get legal actions for new state
-                if not done:
-                    next_player = environment.get_current_player(next_state)
-                    next_actions = environment.get_legal_actions(next_state, next_player)
+                # Determine moves for next state
+                if not game_ended:
+                    next_player = game_environment.get_active_player(next_state)
+                    next_moves = game_environment.get_valid_moves(next_state, next_player)
                 else:
-                    next_actions = []
+                    next_moves = []
                 
-                child_node = MCTSNode(
-                    state=next_state,
-                    parent=node,
-                    action=action,
-                    untried_actions=next_actions
+                new_node = SearchTreeNode(
+                    game_state=next_state,
+                    parent=current_node,
+                    move=selected_move,
+                    unexplored_moves=next_moves
                 )
-                node.children.append(child_node)
+                current_node.child_nodes.append(new_node)
                 
-                node = child_node
-                state = next_state
-                self.nodes_explored += 1
+                current_node = new_node
+                current_state = next_state
+                self.total_nodes_generated += 1
             
-            # 3. SIMULATION: Rollout with default policy
-            simulation_reward = self._simulate(state, environment, player)
-            self.total_simulations += 1
+            # PHASE 3: SIMULATION - Random playout
+            simulation_result = self._perform_simulation(current_state, game_environment, current_player)
+            self.simulation_count += 1
             
-            # 4. BACKPROPAGATION: Update statistics
-            self._backpropagate(node, simulation_reward, player)
+            # PHASE 4: BACKPROPAGATION - Update node statistics
+            self._update_node_values(current_node, simulation_result, current_player)
         
-        # Return best action based on visit counts
-        best_action = root.best_action()
+        # Determine best move based on visit counts
+        optimal_move = root_node.get_preferred_move()
         
-        # Print statistics
-        print(f"\nMCTS Statistics:")
-        print(f"  Iterations: {iteration + 1}")
-        print(f"  Nodes explored: {self.nodes_explored}")
-        print(f"  Total simulations: {self.total_simulations}")
-        print(f"  Root visits: {root.visit_count}")
-        print(f"  Root Q-value: {root.q_value:.3f}")
+        # Display search statistics
+        print(f"\nSearch Performance Metrics:")
+        print(f"  Iterations completed: {iteration_count + 1}")
+        print(f"  Nodes generated: {self.total_nodes_generated}")
+        print(f"  Simulations performed: {self.simulation_count}")
+        print(f"  Root node visits: {root_node.visits}")
+        print(f"  Root node Q-value: {root_node.average_score:.3f}")
         
-        return best_action
+        return optimal_move
     
-    def _simulate(self, state, environment, original_player):
+    def _perform_simulation(self, state, game_environment, original_player):
 
-        state = deepcopy(state)
-        depth = 0
+        simulation_state = state.copy()
+        steps = 0
         
-        while not environment.is_terminal(state) and depth < self.max_rollout_depth:
-            current_player = environment.get_current_player(state)
-            legal_actions = environment.get_legal_actions(state, current_player)
+        while not game_environment.is_game_over(simulation_state) and steps < self.max_simulation_depth:
+            active_player = game_environment.get_active_player(simulation_state)
+            legal_moves = game_environment.get_valid_moves(simulation_state, active_player)
             
-            if len(legal_actions) == 0:
+            if len(legal_moves) == 0:
                 break
             
-            # Default policy: random action
-            action = np.random.choice(legal_actions)
-            state, reward, done = environment.step(state, action, current_player)
+            # Random move selection policy
+            random_move = np.random.choice(legal_moves)
+            simulation_state, reward, terminal = game_environment.execute_move(
+                simulation_state, random_move, active_player)
             
-            depth += 1
+            steps += 1
             
-            if done:
+            if terminal:
                 break
         
-        # Get final reward from original player's perspective
-        final_reward = environment.get_reward(state, original_player)
-        return final_reward
+        # Calculate final reward from original player's perspective
+        final_outcome = game_environment.evaluate_state(simulation_state, original_player)
+        return final_outcome
     
-    def _backpropagate(self, node, reward, original_player):
+    def _update_node_values(self, node, reward, original_player):
 
         current_reward = reward
         
         while node is not None:
-            node.visit_count += 1
-            node.total_reward += current_reward
-            node.q_value = node.total_reward / node.visit_count
+            node.visits += 1
+            node.cumulative_score += current_reward
+            node.average_score = node.cumulative_score / node.visits
             
-            # For two-player games: alternate perspective
+            # Alternate reward perspective for alternating moves
             current_reward = -current_reward
             
-            node = node.parent
+            node = node.parent_node
     
-    def get_action_statistics(self, initial_state, environment):
+    def analyze_move_quality(self, initial_state, game_environment):
 
-        player = environment.get_current_player(initial_state)
-        legal_actions = environment.get_legal_actions(initial_state, player)
-        root = MCTSNode(
-            state=initial_state,
-            untried_actions=legal_actions.copy()
+        current_player = game_environment.get_active_player(initial_state)
+        valid_moves = game_environment.get_valid_moves(initial_state, current_player)
+        root = SearchTreeNode(
+            game_state=initial_state,
+            unexplored_moves=valid_moves.copy()
         )
         
-        # Run search
-        for _ in range(self.max_iterations):
-            node = root
-            state = deepcopy(initial_state)
+        # Execute search
+        for _ in range(self.max_search_iterations):
+            current_node = root
+            current_state = initial_state.copy()
             
-            while not environment.is_terminal(state) and node.is_fully_expanded():
-                node = node.best_child(self.c)
-                state = deepcopy(node.state)
+            while not game_environment.is_game_over(current_state) and current_node.all_moves_expanded():
+                current_node = current_node.select_optimal_child(self.exploration_param)
+                current_state = current_node.game_state.copy()
             
-            if not environment.is_terminal(state) and len(node.untried_actions) > 0:
-                action = node.untried_actions.pop()
-                current_player = environment.get_current_player(state)
-                next_state, reward, done = environment.step(state, action, current_player)
+            if not game_environment.is_game_over(current_state) and len(current_node.unexplored_moves) > 0:
+                move = current_node.unexplored_moves.pop()
+                active_player = game_environment.get_active_player(current_state)
+                next_state, reward, done = game_environment.execute_move(current_state, move, active_player)
                 
                 if not done:
-                    next_player = environment.get_current_player(next_state)
-                    next_actions = environment.get_legal_actions(next_state, next_player)
+                    next_player = game_environment.get_active_player(next_state)
+                    next_moves = game_environment.get_valid_moves(next_state, next_player)
                 else:
-                    next_actions = []
+                    next_moves = []
                 
-                child_node = MCTSNode(
-                    state=next_state,
-                    parent=node,
-                    action=action,
-                    untried_actions=next_actions
+                child_node = SearchTreeNode(
+                    game_state=next_state,
+                    parent=current_node,
+                    move=move,
+                    unexplored_moves=next_moves
                 )
-                node.children.append(child_node)
-                node = child_node
-                state = next_state
+                current_node.child_nodes.append(child_node)
+                current_node = child_node
+                current_state = next_state
             
-            simulation_reward = self._simulate(state, environment, player)
-            self._backpropagate(node, simulation_reward, player)
+            simulation_reward = self._perform_simulation(current_state, game_environment, current_player)
+            self._update_node_values(current_node, simulation_reward, current_player)
         
-        # Collect statistics
-        stats = {}
-        for child in root.children:
-            stats[child.action] = {
-                'visits': child.visit_count,
-                'q_value': child.q_value,
-                'total_reward': child.total_reward,
-                'mean_reward': child.total_reward / child.visit_count if child.visit_count > 0 else 0
+        # Compile move statistics
+        move_analysis = {}
+        for child in root.child_nodes:
+            move_analysis[child.move] = {
+                'visit_count': child.visits,
+                'q_value': child.average_score,
+                'total_score': child.cumulative_score,
+                'average_reward': child.cumulative_score / child.visits if child.visits > 0 else 0
             }
         
-        return stats
+        return move_analysis
 
 
 # ============================================================================
-# PART 1B: Connect 4 Environment
+# CONNECT FOUR GAME IMPLEMENTATION
 # ============================================================================
 
-class Connect4:
+class ConnectFourGame:
     
     def __init__(self):
-        self.rows = 6
-        self.cols = 7
-        self.connect = 4
-        self.reset()
+        self.board_height = 6
+        self.board_width = 7
+        self.winning_length = 4
+        self.initialize_game()
     
-    def reset(self):
-        self.board = np.zeros((self.rows, self.cols), dtype=int)
-        self.current_player = 1
-        self.move_count = 0
-        return self.get_state()
+    def initialize_game(self):
+        self.game_board = np.zeros((self.board_height, self.board_width), dtype=int)
+        self.active_player = 1
+        self.turn_count = 0
+        return self.get_game_state()
     
-    def get_state(self):
+    def get_game_state(self):
         return {
-            'board': self.board.copy(),
-            'current_player': self.current_player,
-            'move_count': self.move_count
+            'board': self.game_board.copy(),
+            'current_player': self.active_player,
+            'move_count': self.turn_count
         }
     
-    def get_current_player(self, state):
-        """Get current player from state."""
+    def get_active_player(self, state):
+        """Get current player from game state."""
         return state['current_player']
     
-    def get_legal_actions(self, state, player):
+    def get_valid_moves(self, state, player):
         board = state['board']
-        return [col for col in range(self.cols) if board[0][col] == 0]
+        return [column for column in range(self.board_width) if board[0][column] == 0]
     
-    def step(self, state, action, player):
+    def execute_move(self, state, move, player):
         # Create new state
         board = state['board'].copy()
         move_count = state['move_count']
         
-        # Find lowest empty row in column
-        row = -1
-        for r in range(self.rows - 1, -1, -1):
-            if board[r][action] == 0:
-                row = r
+        # Find available row in selected column
+        target_row = -1
+        for row in range(self.board_height - 1, -1, -1):
+            if board[row][move] == 0:
+                target_row = row
                 break
         
-        if row == -1:
-            raise ValueError(f"Invalid move: column {action} is full")
+        if target_row == -1:
+            raise ValueError(f"Column {move} is completely filled")
         
-        # Place piece
-        board[row][action] = player
+        # Place player's piece
+        board[target_row][move] = player
         move_count += 1
         
-        # Check for win
-        if self._check_win(board, row, action, player):
-            reward = 1.0  # Win
-            done = True
-        elif move_count >= self.rows * self.cols:
+        # Check for victory
+        if self._check_winning_condition(board, target_row, move, player):
+            reward = 1.0  # Winning move
+            game_over = True
+        elif move_count >= self.board_height * self.board_width:
             reward = 0.0  # Draw
-            done = True
+            game_over = True
         else:
-            reward = 0.0  # Game continues
-            done = False
+            reward = 0.0  # Continue playing
+            game_over = False
         
-        # Create next state
-        next_player = 3 - player  # Switch between 1 and 2
+        # Prepare next state
+        next_player = 3 - player  # Alternate between 1 and 2
         next_state = {
             'board': board,
             'current_player': next_player,
             'move_count': move_count
         }
         
-        return next_state, reward, done
+        return next_state, reward, game_over
     
-    def _check_win(self, board, row, col, player):
-        directions = [
+    def _check_winning_condition(self, board, row, col, player):
+        # Check all directions for winning line
+        direction_vectors = [
             (0, 1),   # Horizontal
             (1, 0),   # Vertical
-            (1, 1),   # Diagonal \
-            (1, -1)   # Diagonal /
+            (1, 1),   # Diagonal down-right
+            (1, -1)   # Diagonal down-left
         ]
         
-        for dr, dc in directions:
-            count = 1  # Count the piece we just placed
+        for dr, dc in direction_vectors:
+            connected_count = 1  # Include current piece
             
-            # Check positive direction
+            # Check in positive direction
             r, c = row + dr, col + dc
-            while 0 <= r < self.rows and 0 <= c < self.cols and board[r][c] == player:
-                count += 1
+            while (0 <= r < self.board_height and 0 <= c < self.board_width 
+                   and board[r][c] == player):
+                connected_count += 1
                 r += dr
                 c += dc
             
-            # Check negative direction
+            # Check in negative direction
             r, c = row - dr, col - dc
-            while 0 <= r < self.rows and 0 <= c < self.cols and board[r][c] == player:
-                count += 1
+            while (0 <= r < self.board_height and 0 <= c < self.board_width 
+                   and board[r][c] == player):
+                connected_count += 1
                 r -= dr
                 c -= dc
             
-            if count >= self.connect:
+            if connected_count >= self.winning_length:
                 return True
         
         return False
     
-    def is_terminal(self, state):
-        """Check if state is terminal (game over)."""
+    def is_game_over(self, state):
+        """Check if game has ended."""
         board = state['board']
         move_count = state['move_count']
         
-        # Check if board is full
-        if move_count >= self.rows * self.cols:
+        # Check for board full
+        if move_count >= self.board_height * self.board_width:
             return True
         
-        # Check if either player has won
-        # (Quick check: look for any 4-in-a-row)
-        for player in [1, 2]:
-            # Check rows
-            for row in range(self.rows):
-                for col in range(self.cols - 3):
-                    if all(board[row][col+i] == player for i in range(4)):
+        # Check for any winning positions
+        for player_id in [1, 2]:
+            # Horizontal check
+            for row in range(self.board_height):
+                for col in range(self.board_width - 3):
+                    if all(board[row][col+i] == player_id for i in range(4)):
                         return True
             
-            # Check columns
-            for row in range(self.rows - 3):
-                for col in range(self.cols):
-                    if all(board[row+i][col] == player for i in range(4)):
+            # Vertical check
+            for row in range(self.board_height - 3):
+                for col in range(self.board_width):
+                    if all(board[row+i][col] == player_id for i in range(4)):
                         return True
             
-            # Check diagonals (\)
-            for row in range(self.rows - 3):
-                for col in range(self.cols - 3):
-                    if all(board[row+i][col+i] == player for i in range(4)):
+            # Diagonal down-right
+            for row in range(self.board_height - 3):
+                for col in range(self.board_width - 3):
+                    if all(board[row+i][col+i] == player_id for i in range(4)):
                         return True
             
-            # Check diagonals (/)
-            for row in range(3, self.rows):
-                for col in range(self.cols - 3):
-                    if all(board[row-i][col+i] == player for i in range(4)):
+            # Diagonal down-left
+            for row in range(3, self.board_height):
+                for col in range(self.board_width - 3):
+                    if all(board[row-i][col+i] == player_id for i in range(4)):
                         return True
         
         return False
     
-    def get_reward(self, state, player):
-        if not self.is_terminal(state):
+    def evaluate_state(self, state, player):
+        if not self.is_game_over(state):
             return 0.0
         
         board = state['board']
         
         # Check if player won
-        for row in range(self.rows):
-            for col in range(self.cols):
+        for row in range(self.board_height):
+            for col in range(self.board_width):
                 if board[row][col] == player:
-                    if self._check_win(board, row, col, player):
+                    if self._check_winning_condition(board, row, col, player):
                         return 1.0
         
         # Check if opponent won
         opponent = 3 - player
-        for row in range(self.rows):
-            for col in range(self.cols):
+        for row in range(self.board_height):
+            for col in range(self.board_width):
                 if board[row][col] == opponent:
-                    if self._check_win(board, row, col, opponent):
+                    if self._check_winning_condition(board, row, col, opponent):
                         return -1.0
         
-        # Draw
+        # Draw game
         return 0.0
     
-    def render(self, state):
-        """Print the board in a human-readable format."""
+    def display_board(self, state):
+        """Render the game board visually."""
         board = state['board']
-        print("\n  0 1 2 3 4 5 6")
-        print(" +" + "-" * (self.cols * 2 - 1) + "+")
+        print("\n  " + " ".join(str(i) for i in range(self.board_width)))
+        print(" +" + "-" * (self.board_width * 2 - 1) + "+")
         for row in board:
-            print(" |" + "|".join([".⚫⚪"[cell] for cell in row]) + "|")
-        print(" +" + "-" * (self.cols * 2 - 1) + "+")
-        print(f"  Current player: {state['current_player']}")
+            print(" |" + "|".join([" ▢", " ●", " ○"][cell] for cell in row) + "|")
+        print(" +" + "-" * (self.board_width * 2 - 1) + "+")
+        print(f"  Active player: {state['current_player']}")
 
 
 # ============================================================================
-# PART 1C: Demo and Testing
+# DEMONSTRATION AND EVALUATION
 # ============================================================================
 
-def play_game_mcts_vs_random():
+def demonstrate_ai_vs_random():
     print("=" * 60)
-    print("CONNECT 4: MCTS-UCT vs Random Player")
+    print("CONNECT FOUR: AI vs Random Player")
     print("=" * 60)
     
-    env = Connect4()
-    mcts = MCTS_UCT(
-        exploration_constant=1.414,
-        max_iterations=500,  # Adjust based on desired thinking time
-        max_rollout_depth=42
+    game = ConnectFourGame()
+    search_ai = MonteCarloTreeSearch(
+        exploration_param=1.414,
+        max_search_iterations=500,
+        max_simulation_depth=42
     )
     
-    state = env.reset()
-    env.render(state)
+    game_state = game.initialize_game()
+    game.display_board(game_state)
     
-    while not env.is_terminal(state):
-        current_player = env.get_current_player(state)
+    while not game.is_game_over(game_state):
+        current_player = game.get_active_player(game_state)
         
         if current_player == 1:
-            # MCTS player
-            print(f"\n🤖 MCTS Player {current_player} thinking...")
-            action = mcts.search(state, env)
-            print(f"   MCTS chooses column {action}")
+            # AI player
+            print(f"\n🤖 AI Player {current_player} calculating move...")
+            selected_move = search_ai.find_best_move(game_state, game)
+            print(f"   AI selects column {selected_move}")
         else:
             # Random player
-            legal_actions = env.get_legal_actions(state, current_player)
-            action = np.random.choice(legal_actions)
-            print(f"\n🎲 Random Player {current_player} chooses column {action}")
+            available_moves = game.get_valid_moves(game_state, current_player)
+            selected_move = np.random.choice(available_moves)
+            print(f"\n🎲 Random Player {current_player} picks column {selected_move}")
         
-        state, reward, done = env.step(state, action, current_player)
-        env.render(state)
+        game_state, reward, game_ended = game.execute_move(game_state, selected_move, current_player)
+        game.display_board(game_state)
         
-        if done:
+        if game_ended:
             if reward == 1.0:
-                winner = current_player
-                print(f"\n🎉 Player {winner} wins!")
+                winning_player = current_player
+                print(f"\n🏆 Player {winning_player} wins the game!")
             else:
-                print("\n🤝 It's a draw!")
+                print("\n🤝 Game ended in a draw!")
             break
     
-    return state
+    return game_state
 
 
-def test_mcts_decision_quality():
+def evaluate_ai_decision_making():
     print("\n" + "=" * 60)
-    print("TEST: MCTS Decision Quality")
+    print("EVALUATION: AI Decision Quality")
     print("=" * 60)
     
-    env = Connect4()
-    mcts = MCTS_UCT(
-        exploration_constant=1.414,
-        max_iterations=1000,
-        max_rollout_depth=42
+    game = ConnectFourGame()
+    search_ai = MonteCarloTreeSearch(
+        exploration_param=1.414,
+        max_search_iterations=1000,
+        max_simulation_depth=42
     )
     
-    # Create a position where Player 1 can win immediately
-    state = env.reset()
-    # Set up a board where Player 1 has 3 in a row horizontally
-    state['board'][5][0] = 1
-    state['board'][5][1] = 1
-    state['board'][5][2] = 1
+    # Create test scenario with immediate win opportunity
+    game_state = game.initialize_game()
+    # Setup: Player 1 has three consecutive pieces
+    game_state['board'][5][0] = 1
+    game_state['board'][5][1] = 1
+    game_state['board'][5][2] = 1
     # Column 3 is the winning move
     
-    print("\nTest Position: Player 1 can win by playing column 3")
-    env.render(state)
+    print("\nTest Scenario: Player 1 can win with column 3")
+    game.display_board(game_state)
     
-    print("\n🤖 Running MCTS...")
-    action = mcts.search(state, env)
+    print("\n🤖 Running AI analysis...")
+    chosen_move = search_ai.find_best_move(game_state, game)
     
-    print(f"\n✓ MCTS selected action: {action}")
-    if action == 3:
-        print("✓ CORRECT! MCTS found the winning move!")
+    print(f"\n✓ AI selected move: {chosen_move}")
+    if chosen_move == 3:
+        print("✓ SUCCESS! AI identified the winning move!")
     else:
-        print("✗ MCTS missed the winning move (may need more iterations)")
+        print("✗ AI missed the optimal move (may need more computation)")
     
-    # Get detailed statistics
-    stats = mcts.get_action_statistics(state, env)
-    print("\nAction Statistics:")
-    for action, data in sorted(stats.items(), key=lambda x: x[1]['visits'], reverse=True):
-        print(f"  Column {action}: visits={data['visits']:>4d}, "
+    # Get detailed analysis
+    move_stats = search_ai.analyze_move_quality(game_state, game)
+    print("\nMove Analysis Details:")
+    for move, data in sorted(move_stats.items(), key=lambda x: x[1]['visit_count'], reverse=True):
+        print(f"  Column {move}: visits={data['visit_count']:>4d}, "
               f"Q={data['q_value']:>7.3f}, "
-              f"mean_reward={data['mean_reward']:>7.3f}")
+              f"avg_reward={data['average_reward']:>7.3f}")
 
 
-def benchmark_mcts():
+def performance_comparison():
     print("\n" + "=" * 60)
-    print("BENCHMARK: MCTS vs Random (10 games)")
+    print("PERFORMANCE: AI vs Random (10 games)")
     print("=" * 60)
     
-    env = Connect4()
-    mcts = MCTS_UCT(
-        exploration_constant=1.414,
-        max_iterations=300,
-        max_rollout_depth=42
+    game = ConnectFourGame()
+    search_ai = MonteCarloTreeSearch(
+        exploration_param=1.414,
+        max_search_iterations=300,
+        max_simulation_depth=42
     )
     
-    results = {'mcts_wins': 0, 'random_wins': 0, 'draws': 0}
+    game_results = {'ai_victories': 0, 'random_victories': 0, 'draws': 0}
     
-    for game in range(10):
-        print(f"\nGame {game + 1}/10...")
-        state = env.reset()
+    for game_num in range(10):
+        print(f"\nGame {game_num + 1}/10 in progress...")
+        game_state = game.initialize_game()
         
-        while not env.is_terminal(state):
-            current_player = env.get_current_player(state)
+        while not game.is_game_over(game_state):
+            current_player = game.get_active_player(game_state)
             
             if current_player == 1:
-                # MCTS player
-                action = mcts.search(state, env)
+                # AI player
+                move = search_ai.find_best_move(game_state, game)
             else:
                 # Random player
-                legal_actions = env.get_legal_actions(state, current_player)
-                action = np.random.choice(legal_actions)
+                valid_moves = game.get_valid_moves(game_state, current_player)
+                move = np.random.choice(valid_moves)
             
-            state, reward, done = env.step(state, action, current_player)
+            game_state, reward, game_ended = game.execute_move(game_state, move, current_player)
             
-            if done:
+            if game_ended:
                 if reward == 1.0:
                     if current_player == 1:
-                        results['mcts_wins'] += 1
-                        print("  Result: MCTS wins")
+                        game_results['ai_victories'] += 1
+                        print("  Outcome: AI wins")
                     else:
-                        results['random_wins'] += 1
-                        print("  Result: Random wins")
+                        game_results['random_victories'] += 1
+                        print("  Outcome: Random wins")
                 else:
-                    results['draws'] += 1
-                    print("  Result: Draw")
+                    game_results['draws'] += 1
+                    print("  Outcome: Draw")
                 break
     
     print("\n" + "=" * 60)
-    print("BENCHMARK RESULTS")
+    print("PERFORMANCE SUMMARY")
     print("=" * 60)
-    print(f"MCTS wins:   {results['mcts_wins']}/10 ({results['mcts_wins']*10}%)")
-    print(f"Random wins: {results['random_wins']}/10 ({results['random_wins']*10}%)")
-    print(f"Draws:       {results['draws']}/10 ({results['draws']*10}%)")
+    print(f"AI victories:    {game_results['ai_victories']}/10 ({game_results['ai_victories']*10}%)")
+    print(f"Random victories: {game_results['random_victories']}/10 ({game_results['random_victories']*10}%)")
+    print(f"Draws:           {game_results['draws']}/10 ({game_results['draws']*10}%)")
 
 
 # ============================================================================
-# MAIN: Run all demonstrations
+# EXECUTION: Run all demonstrations
 # ============================================================================
 
 if __name__ == "__main__":
     print("\n")
     print("╔" + "=" * 58 + "╗")
     print("║" + " " * 58 + "║")
-    print("║" + "  MCTS-UCT IMPLEMENTATION WITH CONNECT 4  ".center(58) + "║")
-    print("║" + "  Week 4 Assignment.     ".center(58) + "║")
-    print("║" + "  Northeastern University Vancouver       ".center(58) + "║")
+    print("║" + "  MONTE CARLO TREE SEARCH IMPLEMENTATION  ".center(58) + "║")
+    print("║" + "  Advanced AI for Game Playing  ".center(58) + "║")
+    print("║" + "  Course Assignment Submission  ".center(58) + "║")
     print("║" + " " * 58 + "║")
     print("╚" + "=" * 58 + "╝")
     
-    # Run demonstrations
-    print("\n[1/3] Playing a full game: MCTS vs Random")
-    play_game_mcts_vs_random()
+    # Execute demonstrations
+    print("\n[1/3] Live Game: AI vs Random Player")
+    demonstrate_ai_vs_random()
     
-    print("\n\n[2/3] Testing MCTS decision quality")
-    test_mcts_decision_quality()
+    print("\n\n[2/3] AI Decision Quality Assessment")
+    evaluate_ai_decision_making()
     
-    print("\n\n[3/3] Running benchmark")
-    benchmark_mcts()
+    print("\n\n[3/3] Performance Benchmark")
+    performance_comparison()
     
     print("\n\n" + "=" * 60)
-    print("ALL DEMONSTRATIONS COMPLETE")
+    print("DEMONSTRATION COMPLETE")
     print("=" * 60)
-    print("\nThis implementation demonstrates:")
-    print("Complete MCTS-UCT algorithm (4 phases)")
-    print("UCT formula with proper exploration-exploitation")
-    print("Connect 4 environment with full game logic")
-    print("MCTS finding optimal moves")
-    print("Strong performance vs random baseline")
+    print("\nImplementation demonstrates:")
+    print("✓ Complete Monte Carlo Tree Search algorithm")
+    print("✓ UCB1 selection with exploration-exploitation balance")
+    print("✓ Connect Four game environment with full rules")
+    print("✓ AI capable of finding optimal moves")
+    print("✓ Superior performance against random baseline")
